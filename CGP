@@ -1,0 +1,842 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using Microsoft.Data.SqlClient;
+using whois; // your User class namespace (you said you moved it)
+
+namespace SqlBackedServer
+{
+    public class Program
+    {
+        // === Configuration ===
+        // Change this to your DB (example shown)
+        private static readonly string connectionString = @"Server=localhost;Database=UsersDB;Trusted_Connection=True;TrustServerCertificate=True;";
+        private static readonly bool debug = true;
+        private static readonly int serverPort = 5000;
+
+        // Allowed single-valued columns in Application.Person (case-insensitive handling done separately)
+        private static readonly string[] allowedPersonColumns = new string[]
+        {
+            "UserID",
+            "Surname",
+            "Forenames",
+            "Title",
+            "Location"
+        };
+
+        // Entry point
+        public static void Main(string[] args)
+        {
+            if (args == null)
+            {
+                Console.WriteLine("No arguments array available.");
+                return;
+            }
+
+            if (args.Length == 0)
+            {
+                Console.WriteLine("Starting Server...");
+                RunServer();
+            }
+            else
+            {
+                for (int i = 0; i < args.Length; i++)
+                {
+                    ProcessCommand(args[i]);
+                }
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Server: simple TCP listener that understands small HTTP-like requests
+        // --------------------------------------------------------------------
+        private static void RunServer()
+        {
+            TcpListener listener;
+            Socket connection;
+            NetworkStream socketStream;
+
+            try
+            {
+                listener = new TcpListener(IPAddress.Any, serverPort);
+                listener.Start();
+                while (true)
+                {
+                    if (debug) Console.WriteLine("Server: waiting for connection...");
+                    connection = listener.AcceptSocket();
+                    connection.SendTimeout = 1000;
+                    connection.ReceiveTimeout = 1000;
+                    socketStream = new NetworkStream(connection);
+                    try
+                    {
+                        doRequest(socketStream);
+                    }
+                    finally
+                    {
+                        socketStream.Close();
+                        connection.Close();
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("Server error: " + e.ToString());
+            }
+
+            if (debug) Console.WriteLine("Server terminating.");
+        }
+
+        // Very small HTTP-like handler for network clients
+        private static void doRequest(NetworkStream socketStream)
+        {
+            StreamWriter sw = new StreamWriter(socketStream);
+            StreamReader sr = new StreamReader(socketStream);
+
+            try
+            {
+                if (debug) Console.WriteLine("Waiting for input from client...");
+                string? line = sr.ReadLine();
+                if (line == null)
+                {
+                    if (debug) Console.WriteLine("Null request line; ignoring.");
+                    return;
+                }
+
+                if (debug) Console.WriteLine("Received Network Command: " + line);
+
+                // POST / HTTP/1.1  <- used by previous program as update of Location
+                if (line == "POST / HTTP/1.1")
+                {
+                    if (debug) Console.WriteLine("Network: received POST update request");
+                    int contentLength = 0;
+                    while (true)
+                    {
+                        string? headerLine = sr.ReadLine();
+                        if (headerLine == null || headerLine.Length == 0)
+                        {
+                            break;
+                        }
+
+                        if (headerLine.StartsWith("Content-Length: ", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string lengthStr = headerLine.Substring(16).Trim();
+                            contentLength = Int32.Parse(lengthStr);
+                        }
+                    }
+
+                    string body = "";
+                    for (int i = 0; i < contentLength; i++)
+                    {
+                        int ch = sr.Read();
+                        if (ch == -1) break;
+                        body += (char)ch;
+                    }
+
+                    if (body.Length > 0)
+                    {
+                        // expected body: id=cssbct&location=Some%20Place (no URL-decode here for simplicity)
+                        string[] parts = body.Split(new char[] { '&' }, 2);
+                        if (parts.Length == 2)
+                        {
+                            string idPart = parts[0];
+                            string valuePart = parts[1];
+                            if (idPart.StartsWith("id=", StringComparison.OrdinalIgnoreCase) &&
+                                valuePart.StartsWith("location=", StringComparison.OrdinalIgnoreCase))
+                            {
+                                string id = idPart.Substring(3);
+                                string value = valuePart.Substring(9);
+                                Update(id, "Location", value);
+                                sw.WriteLine("HTTP/1.1 200 OK");
+                                sw.WriteLine("Content-Type: text/plain");
+                                sw.WriteLine();
+                                sw.WriteLine("OK");
+                                sw.Flush();
+                                return;
+                            }
+                        }
+                    }
+
+                    sw.WriteLine("HTTP/1.1 400 Bad Request");
+                    sw.WriteLine("Content-Type: text/plain");
+                    sw.WriteLine();
+                    sw.Flush();
+                    return;
+                }
+
+                // GET /?name=cssbct HTTP/1.1  <- network lookup for location (returns location)
+                if (line.StartsWith("GET /?name=", StringComparison.OrdinalIgnoreCase) && line.EndsWith(" HTTP/1.1"))
+                {
+                    string[] parts = line.Split(' ');
+                    if (parts.Length >= 2)
+                    {
+                        string middle = parts[1]; // "/?name=cssbct"
+                        if (middle.StartsWith("/?name=", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string id = middle.Substring(7);
+                            string location = LookupNetwork(id);
+                            sw.WriteLine("HTTP/1.1 200 OK");
+                            sw.WriteLine("Content-Type: text/plain");
+                            sw.WriteLine();
+                            sw.WriteLine(location);
+                            sw.Flush();
+                            if (debug) Console.WriteLine($"Network lookup returned '{location}' for '{id}'");
+                            return;
+                        }
+                    }
+
+                    sw.WriteLine("HTTP/1.1 400 Bad Request");
+                    sw.WriteLine("Content-Type: text/plain");
+                    sw.WriteLine();
+                    sw.Flush();
+                    return;
+                }
+
+                // Unknown network command
+                sw.WriteLine("HTTP/1.1 400 Bad Request");
+                sw.WriteLine("Content-Type: text/plain");
+                sw.WriteLine();
+                sw.Flush();
+                if (debug) Console.WriteLine("Unrecognised network command: " + line);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("Network handler error: " + e.ToString());
+            }
+            finally
+            {
+                sw.Close();
+                sr.Close();
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Command-line processing (same syntax as before: id, id?field, id?field=value, id?)
+        // --------------------------------------------------------------------
+        private static void ProcessCommand(string command)
+        {
+            if (debug) Console.WriteLine("\nCommand: " + command);
+            try
+            {
+                string[] parts = command.Split(new char[] { '?' }, 2);
+
+                string id = parts[0];
+                string? operation = null;
+                string? field = null;
+                string? updateValue = null;
+
+                if (parts.Length == 2)
+                {
+                    operation = parts[1];
+                    if (operation.Length == 0)
+                    {
+                        // delete command: "id?"
+                        Delete(id);
+                        return;
+                    }
+
+                    string[] opParts = operation.Split(new char[] { '=' }, 2);
+                    field = opParts[0];
+                    if (opParts.Length == 2)
+                    {
+                        updateValue = opParts[1];
+                    }
+                }
+
+                Console.Write("Operation on ID '" + id + "' ");
+
+                if (operation == null)
+                {
+                    if (!ExistsPerson(id))
+                    {
+                        Console.WriteLine("User '" + id + "' not known");
+                        return;
+                    }
+
+                    Dump(id);
+                    return;
+                }
+
+                if (updateValue == null)
+                {
+                    // lookup mode: id?field
+                    LookupConsole(id, field);
+                    return;
+                }
+
+                // update mode: id?field=value
+                Update(id, field, updateValue);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("Command processing error: " + e.ToString());
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // High-level operations
+        // --------------------------------------------------------------------
+        private static void Dump(string userId)
+        {
+            if (debug) Console.WriteLine("Dump: output all fields for " + userId);
+
+            if (!ExistsPerson(userId))
+            {
+                Console.WriteLine(userId + " does not exist.");
+                return;
+            }
+
+            User u = GetUserSimple(userId);
+
+            Console.WriteLine("UserID=" + u.UserID);
+            Console.WriteLine("Surname=" + u.Surname);
+            Console.WriteLine("Forenames=" + u.Forenames);
+            Console.WriteLine("Title=" + u.Title);
+            Console.WriteLine("Position=" + u.Position);
+            Console.WriteLine("Phone=" + u.Phone);
+            Console.WriteLine("Email=" + u.Email);
+            Console.WriteLine("Location=" + u.Location);
+        }
+
+        // Network lookup returns Location (for GET /?name=)
+        private static string LookupNetwork(string userId)
+        {
+            if (!ExistsPerson(userId))
+            {
+                return "404 Not Found";
+            }
+            User u = GetUserSimple(userId);
+            if (u.Location == null)
+            {
+                return "";
+            }
+            return u.Location;
+        }
+
+        // Console lookup prints requested field
+        private static void LookupConsole(string userId, string? field)
+        {
+            if (field == null || field.Length == 0)
+            {
+                Console.WriteLine("No field specified.");
+                return;
+            }
+
+            if (!ExistsPerson(userId))
+            {
+                Console.WriteLine(userId + " does not exist.");
+                return;
+            }
+
+            string normalized = NormalizeFieldName(field);
+            string output = LookupFieldValue(userId, normalized);
+            Console.WriteLine(output);
+        }
+
+        // Returns canonical field name (Title case) if allowed; otherwise returns empty string
+        private static string NormalizeFieldName(string field)
+        {
+            string trimmed = field.Trim();
+            if (trimmed.Length == 0) return "";
+
+            string lower = trimmed.ToLowerInvariant();
+
+            if (lower == "userid") return "UserID";
+            if (lower == "surname") return "Surname";
+            if (lower == "forenames") return "Forenames";
+            if (lower == "title") return "Title";
+            if (lower == "location") return "Location";
+            if (lower == "phone") return "Phone";
+            if (lower == "email") return "Email";
+            if (lower == "position") return "Position";
+
+            // unknown field -> return empty to cause empty output
+            return "";
+        }
+
+        // Returns the string value for a given canonical field name
+        private static string LookupFieldValue(string userId, string canonicalField)
+        {
+            if (canonicalField.Length == 0) return "";
+
+            if (canonicalField == "Phone")
+            {
+                return GetAllPhones(userId);
+            }
+            if (canonicalField == "Email")
+            {
+                return GetAllEmails(userId);
+            }
+            if (canonicalField == "Position")
+            {
+                return GetAllPositions(userId);
+            }
+
+            // remaining fields are in Application.Person
+            return GetPersonField(userId, canonicalField);
+        }
+
+        // Update handler: single-valued columns are updated; multi-valued columns add new entries
+        private static void Update(string userId, string? field, string? value)
+        {
+            if (field == null || field.Length == 0 || value == null)
+            {
+                Console.WriteLine("Invalid update command.");
+                return;
+            }
+
+            string canonicalField = NormalizeFieldName(field);
+            if (canonicalField.Length == 0)
+            {
+                Console.WriteLine("Unknown field.");
+                return;
+            }
+
+            if (!ExistsPerson(userId))
+            {
+                CreateEmptyPerson(userId);
+                Console.WriteLine("New user '" + userId + "' was created");
+            }
+
+            if (canonicalField == "Email")
+            {
+                AddEmail(userId, value);
+                Console.WriteLine("OK");
+                return;
+            }
+
+            if (canonicalField == "Phone")
+            {
+                AddPhone(userId, value);
+                Console.WriteLine("OK");
+                return;
+            }
+
+            if (canonicalField == "Position")
+            {
+                AddPosition(userId, value);
+                Console.WriteLine("OK");
+                return;
+            }
+
+            // Single-valued column update - ensure column is allowed (safety)
+            bool allowed = false;
+            for (int i = 0; i < allowedPersonColumns.Length; i++)
+            {
+                if (string.Equals(allowedPersonColumns[i], canonicalField, StringComparison.OrdinalIgnoreCase))
+                {
+                    allowed = true;
+                    break;
+                }
+            }
+
+            if (!allowed)
+            {
+                Console.WriteLine("Field not allowed for update.");
+                return;
+            }
+
+            // Safe update: column name is validated above; value is parameterised
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                string sql = "UPDATE Application.Person SET " + canonicalField + " = @Value WHERE UserID = @UserID";
+                using (SqlCommand cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@Value", value);
+                    cmd.Parameters.AddWithValue("@UserID", userId);
+                    int rows = cmd.ExecuteNonQuery();
+                    if (debug) Console.WriteLine("Update rows affected: " + rows);
+                }
+            }
+
+            Console.WriteLine("OK");
+        }
+
+        private static void Delete(string userId)
+        {
+            if (!ExistsPerson(userId))
+            {
+                Console.WriteLine(userId + " does not exist.");
+                return;
+            }
+
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                using (SqlTransaction tran = conn.BeginTransaction())
+                {
+                    try
+                    {
+                        string sql = "DELETE FROM Application.Person WHERE UserID = @UserID";
+                        using (SqlCommand cmd = new SqlCommand(sql, conn, tran))
+                        {
+                            cmd.Parameters.AddWithValue("@UserID", userId);
+                            int rows = cmd.ExecuteNonQuery();
+                            if (debug) Console.WriteLine("Delete rows: " + rows);
+                        }
+                        tran.Commit();
+                        Console.WriteLine("Deleted.");
+                    }
+                    catch (Exception e)
+                    {
+                        tran.Rollback();
+                        Console.WriteLine("Error deleting user: " + e.Message);
+                    }
+                }
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Database helpers
+        // --------------------------------------------------------------------
+        private static bool ExistsPerson(string userId)
+        {
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                string sql = "SELECT COUNT(*) FROM Application.Person WHERE UserID = @UserID";
+                using (SqlCommand cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@UserID", userId);
+                    object? result = cmd.ExecuteScalar();
+                    if (result == null || result == DBNull.Value) return false;
+                    int count = Convert.ToInt32(result);
+                    return count > 0;
+                }
+            }
+        }
+
+        private static void CreateEmptyPerson(string userId)
+        {
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                string sql = "INSERT INTO Application.Person (UserID, Surname, Forenames, Title, Location) VALUES (@UserID, @Surname, @Forenames, @Title, @Location)";
+                using (SqlCommand cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@UserID", userId);
+                    cmd.Parameters.AddWithValue("@Surname", "");
+                    cmd.Parameters.AddWithValue("@Forenames", "");
+                    cmd.Parameters.AddWithValue("@Title", "");
+                    cmd.Parameters.AddWithValue("@Location", "");
+                    cmd.ExecuteNonQuery();
+                }
+            }
+        }
+
+        private static User GetUserSimple(string userId)
+        {
+            User u = new User();
+            u.UserID = "";
+            u.Surname = "";
+            u.Forenames = "";
+            u.Title = "";
+            u.Location = "";
+            u.Email = "";
+            u.Phone = "";
+            u.Position = "";
+
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                string sql = "SELECT UserID, Surname, Forenames, Title, Location FROM Application.Person WHERE UserID = @UserID";
+                using (SqlCommand cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@UserID", userId);
+                    using (SqlDataReader reader = cmd.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            object? oUserId = reader["UserID"];
+                            if (oUserId != null && oUserId != DBNull.Value) u.UserID = Convert.ToString(oUserId) ?? "";
+                            object? oSurname = reader["Surname"];
+                            if (oSurname != null && oSurname != DBNull.Value) u.Surname = Convert.ToString(oSurname) ?? "";
+                            object? oForenames = reader["Forenames"];
+                            if (oForenames != null && oForenames != DBNull.Value) u.Forenames = Convert.ToString(oForenames) ?? "";
+                            object? oTitle = reader["Title"];
+                            if (oTitle != null && oTitle != DBNull.Value) u.Title = Convert.ToString(oTitle) ?? "";
+                            object? oLocation = reader["Location"];
+                            if (oLocation != null && oLocation != DBNull.Value) u.Location = Convert.ToString(oLocation) ?? "";
+                        }
+                    }
+                }
+
+                // multi-valued fields: return comma-separated lists
+                u.Email = GetAllEmails(userId);
+                u.Phone = GetAllPhones(userId);
+                u.Position = GetAllPositions(userId);
+            }
+
+            return u;
+        }
+
+        private static string GetPersonField(string userId, string field)
+        {
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                string sql = "SELECT " + field + " FROM Application.Person WHERE UserID = @UserID";
+                using (SqlCommand cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@UserID", userId);
+                    object? result = cmd.ExecuteScalar();
+                    if (result == null || result == DBNull.Value) return "";
+                    return Convert.ToString(result) ?? "";
+                }
+            }
+        }
+
+        private static string GetAllEmails(string userId)
+        {
+            List<string> list = new List<string>();
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                string sql = "SELECT e.EmailAddress FROM Application.Email e JOIN Application.PersonEmail pe ON e.EmailID = pe.EmailID WHERE pe.UserID = @UserID ORDER BY e.EmailID ASC";
+                using (SqlCommand cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@UserID", userId);
+                    using (SqlDataReader reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            object? o = reader["EmailAddress"];
+                            if (o != null && o != DBNull.Value) list.Add(Convert.ToString(o) ?? "");
+                        }
+                    }
+                }
+            }
+            return String.Join(", ", list);
+        }
+
+        private static string GetAllPhones(string userId)
+        {
+            List<string> list = new List<string>();
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                string sql = "SELECT p.PhoneNumber FROM Application.Phone p JOIN Application.PersonPhone pp ON p.PhoneID = pp.PhoneID WHERE pp.UserID = @UserID ORDER BY p.PhoneID ASC";
+                using (SqlCommand cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@UserID", userId);
+                    using (SqlDataReader reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            object? o = reader["PhoneNumber"];
+                            if (o != null && o != DBNull.Value) list.Add(Convert.ToString(o) ?? "");
+                        }
+                    }
+                }
+            }
+            return String.Join(", ", list);
+        }
+
+        private static string GetAllPositions(string userId)
+        {
+            List<string> list = new List<string>();
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                string sql = "SELECT pos.PositionName FROM Application.Position pos JOIN Application.PersonPosition pp ON pos.PositionID = pp.PositionID WHERE pp.UserID = @UserID ORDER BY pos.PositionID ASC";
+                using (SqlCommand cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@UserID", userId);
+                    using (SqlDataReader reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            object? o = reader["PositionName"];
+                            if (o != null && o != DBNull.Value) list.Add(Convert.ToString(o) ?? "");
+                        }
+                    }
+                }
+            }
+            return String.Join(", ", list);
+        }
+
+        // Add operations for multi-valued fields (insert master row if needed, then link)
+        private static void AddEmail(string userId, string emailAddress)
+        {
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                using (SqlTransaction tran = conn.BeginTransaction())
+                {
+                    try
+                    {
+                        int emailId = -1;
+                        string findSql = "SELECT EmailID FROM Application.Email WHERE EmailAddress = @EmailAddress";
+                        using (SqlCommand findCmd = new SqlCommand(findSql, conn, tran))
+                        {
+                            findCmd.Parameters.AddWithValue("@EmailAddress", emailAddress);
+                            object? findObj = findCmd.ExecuteScalar();
+                            if (findObj != null && findObj != DBNull.Value)
+                            {
+                                emailId = Convert.ToInt32(findObj);
+                            }
+                            else
+                            {
+                                string insertSql = "INSERT INTO Application.Email (EmailAddress) VALUES (@EmailAddress); SELECT SCOPE_IDENTITY();";
+                                using (SqlCommand insertCmd = new SqlCommand(insertSql, conn, tran))
+                                {
+                                    insertCmd.Parameters.AddWithValue("@EmailAddress", emailAddress);
+                                    object? idObj = insertCmd.ExecuteScalar();
+                                    emailId = Convert.ToInt32(Convert.ToDecimal(idObj));
+                                }
+                            }
+                        }
+
+                        string linkCheckSql = "SELECT COUNT(*) FROM Application.PersonEmail WHERE UserID = @UserID AND EmailID = @EmailID";
+                        using (SqlCommand linkChk = new SqlCommand(linkCheckSql, conn, tran))
+                        {
+                            linkChk.Parameters.AddWithValue("@UserID", userId);
+                            linkChk.Parameters.AddWithValue("@EmailID", emailId);
+                            int linkCount = Convert.ToInt32(linkChk.ExecuteScalar());
+                            if (linkCount == 0)
+                            {
+                                string linkSql = "INSERT INTO Application.PersonEmail (UserID, EmailID) VALUES (@UserID, @EmailID)";
+                                using (SqlCommand linkCmd = new SqlCommand(linkSql, conn, tran))
+                                {
+                                    linkCmd.Parameters.AddWithValue("@UserID", userId);
+                                    linkCmd.Parameters.AddWithValue("@EmailID", emailId);
+                                    linkCmd.ExecuteNonQuery();
+                                }
+                            }
+                        }
+
+                        tran.Commit();
+                    }
+                    catch (Exception)
+                    {
+                        tran.Rollback();
+                        throw;
+                    }
+                }
+            }
+        }
+
+        private static void AddPhone(string userId, string phoneNumber)
+        {
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                using (SqlTransaction tran = conn.BeginTransaction())
+                {
+                    try
+                    {
+                        int phoneId = -1;
+                        string findSql = "SELECT PhoneID FROM Application.Phone WHERE PhoneNumber = @PhoneNumber";
+                        using (SqlCommand findCmd = new SqlCommand(findSql, conn, tran))
+                        {
+                            findCmd.Parameters.AddWithValue("@PhoneNumber", phoneNumber);
+                            object? findObj = findCmd.ExecuteScalar();
+                            if (findObj != null && findObj != DBNull.Value)
+                            {
+                                phoneId = Convert.ToInt32(findObj);
+                            }
+                            else
+                            {
+                                string insertSql = "INSERT INTO Application.Phone (PhoneNumber) VALUES (@PhoneNumber); SELECT SCOPE_IDENTITY();";
+                                using (SqlCommand insertCmd = new SqlCommand(insertSql, conn, tran))
+                                {
+                                    insertCmd.Parameters.AddWithValue("@PhoneNumber", phoneNumber);
+                                    object? idObj = insertCmd.ExecuteScalar();
+                                    phoneId = Convert.ToInt32(Convert.ToDecimal(idObj));
+                                }
+                            }
+                        }
+
+                        string linkCheckSql = "SELECT COUNT(*) FROM Application.PersonPhone WHERE UserID = @UserID AND PhoneID = @PhoneID";
+                        using (SqlCommand linkChk = new SqlCommand(linkCheckSql, conn, tran))
+                        {
+                            linkChk.Parameters.AddWithValue("@UserID", userId);
+                            linkChk.Parameters.AddWithValue("@PhoneID", phoneId);
+                            int linkCount = Convert.ToInt32(linkChk.ExecuteScalar());
+                            if (linkCount == 0)
+                            {
+                                string linkSql = "INSERT INTO Application.PersonPhone (UserID, PhoneID) VALUES (@UserID, @PhoneID)";
+                                using (SqlCommand linkCmd = new SqlCommand(linkSql, conn, tran))
+                                {
+                                    linkCmd.Parameters.AddWithValue("@UserID", userId);
+                                    linkCmd.Parameters.AddWithValue("@PhoneID", phoneId);
+                                    linkCmd.ExecuteNonQuery();
+                                }
+                            }
+                        }
+
+                        tran.Commit();
+                    }
+                    catch (Exception)
+                    {
+                        tran.Rollback();
+                        throw;
+                    }
+                }
+            }
+        }
+
+        private static void AddPosition(string userId, string positionName)
+        {
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+                using (SqlTransaction tran = conn.BeginTransaction())
+                {
+                    try
+                    {
+                        int posId = -1;
+                        string findSql = "SELECT PositionID FROM Application.Position WHERE PositionName = @PositionName";
+                        using (SqlCommand findCmd = new SqlCommand(findSql, conn, tran))
+                        {
+                            findCmd.Parameters.AddWithValue("@PositionName", positionName);
+                            object? findObj = findCmd.ExecuteScalar();
+                            if (findObj != null && findObj != DBNull.Value)
+                            {
+                                posId = Convert.ToInt32(findObj);
+                            }
+                            else
+                            {
+                                string insertSql = "INSERT INTO Application.Position (PositionName) VALUES (@PositionName); SELECT SCOPE_IDENTITY();";
+                                using (SqlCommand insertCmd = new SqlCommand(insertSql, conn, tran))
+                                {
+                                    insertCmd.Parameters.AddWithValue("@PositionName", positionName);
+                                    object? idObj = insertCmd.ExecuteScalar();
+                                    posId = Convert.ToInt32(Convert.ToDecimal(idObj));
+                                }
+                            }
+                        }
+
+                        string linkCheckSql = "SELECT COUNT(*) FROM Application.PersonPosition WHERE UserID = @UserID AND PositionID = @PositionID";
+                        using (SqlCommand linkChk = new SqlCommand(linkCheckSql, conn, tran))
+                        {
+                            linkChk.Parameters.AddWithValue("@UserID", userId);
+                            linkChk.Parameters.AddWithValue("@PositionID", posId);
+                            int linkCount = Convert.ToInt32(linkChk.ExecuteScalar());
+                            if (linkCount == 0)
+                            {
+                                string linkSql = "INSERT INTO Application.PersonPosition (UserID, PositionID) VALUES (@UserID, @PositionID)";
+                                using (SqlCommand linkCmd = new SqlCommand(linkSql, conn, tran))
+                                {
+                                    linkCmd.Parameters.AddWithValue("@UserID", userId);
+                                    linkCmd.Parameters.AddWithValue("@PositionID", posId);
+                                    linkCmd.ExecuteNonQuery();
+                                }
+                            }
+                        }
+
+                        tran.Commit();
+                    }
+                    catch (Exception)
+                    {
+                        tran.Rollback();
+                        throw;
+                    }
+                }
+            }
+        }
+    }
+}
