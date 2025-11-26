@@ -1,0 +1,277 @@
+using System;
+using System.Data.SqlClient;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+
+class Program
+{
+    static Boolean debug = true;
+
+    static void Main(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            Console.WriteLine("Starting Server...");
+            RunServer();
+        }
+        else
+        {
+            for (int i = 0; i < args.Length; i++)
+            {
+                ProcessCommand(args[i]);
+            }
+        }
+    }
+
+    // SQL Connection string
+    private static string connectionString = "Server=your_server_name; Database=3NF; Integrated Security=True;";
+
+    // Run the server and wait for incoming client connections
+    static void RunServer()
+    {
+        TcpListener listener;
+        Socket connection;
+        NetworkStream socketStream;
+
+        try
+        {
+            listener = new TcpListener(IPAddress.Any, 443);
+            listener.Start();
+            while (true)
+            {
+                if (debug) Console.WriteLine("Server Waiting connection...");
+                connection = listener.AcceptSocket();
+                connection.SendTimeout = 1000;
+                connection.ReceiveTimeout = 1000;
+                socketStream = new NetworkStream(connection);
+                doRequest(socketStream);
+                socketStream.Close();
+                connection.Close();
+            }
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine(e.ToString());
+        }
+
+        if (debug)
+            Console.WriteLine("Terminating Server");
+    }
+
+    // Handles a network request (GET or POST)
+    static void doRequest(NetworkStream socketStream)
+    {
+        StreamWriter sw = new StreamWriter(socketStream);
+        StreamReader sr = new StreamReader(socketStream);
+
+        if (debug) Console.WriteLine("Waiting for input from client...");
+
+        try
+        {
+            string line = sr.ReadLine();
+            Console.WriteLine($"Received Network Command: {line}");
+
+            if (line == null)
+            {
+                if (debug) Console.WriteLine("Ignoring null command");
+                return;
+            }
+            if (line == "POST / HTTP/1.1")
+            {
+                // Handle an update request
+                if (debug) Console.WriteLine("Received an update request");
+                ProcessPostRequest(sr, sw);
+            }
+            else if (line.StartsWith("GET /?name=") && line.EndsWith(" HTTP/1.1"))
+            {
+                // Handle a lookup request
+                if (debug) Console.WriteLine("Received a lookup request");
+                ProcessGetRequest(line, sw);
+            }
+            else
+            {
+                // Handle bad requests
+                if (debug) Console.WriteLine($"Unrecognized command: '{line}'");
+                sw.WriteLine("HTTP/1.1 400 Bad Request");
+                sw.WriteLine("Content-Type: text/plain");
+                sw.WriteLine();
+            }
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"Fault in Command Processing: {e.ToString()}");
+        }
+        finally
+        {
+            sw.Close();
+            sr.Close();
+        }
+    }
+
+    // Process POST request for updates
+    static void ProcessPostRequest(StreamReader sr, StreamWriter sw)
+    {
+        int content_length = 0;
+        string line = sr.ReadLine();
+        while (line != "")
+        {
+            if (line.StartsWith("Content-Length: "))
+            {
+                content_length = Int32.Parse(line.Substring(16));
+            }
+            line = sr.ReadLine();
+        }
+
+        line = "";
+        for (int i = 0; i < content_length; i++) line += (char)sr.Read();
+        string[] slices = line.Split(new char[] { '&' }, 2);
+        string ID = slices[0].Substring(5);  // Extract UserID
+        string value = slices[1].Substring(9); // Extract updated value (location)
+
+        if (debug) Console.WriteLine($"Received an update request for '{ID}' to '{value}'");
+        Update(ID, "Location", value);
+    }
+
+    // Process GET request for lookup
+    static void ProcessGetRequest(string line, StreamWriter sw)
+    {
+        string[] slices = line.Split(" ");
+        string ID = slices[1].Substring(7); // Extract UserID from the query string
+
+        if (debug) Console.WriteLine($"Looking up ID: {ID}");
+
+        // Query the database
+        string result = Lookup(ID, "Location"); // We can change "Location" to other fields like "Surname", etc.
+
+        if (result != null)
+        {
+            sw.WriteLine("HTTP/1.1 200 OK");
+            sw.WriteLine("Content-Type: text/plain");
+            sw.WriteLine();
+            sw.WriteLine(result);
+            sw.Flush();
+            Console.WriteLine($"Performed Lookup on '{ID}' returning '{result}'");
+        }
+        else
+        {
+            sw.WriteLine("HTTP/1.1 404 Not Found");
+            sw.WriteLine("Content-Type: text/plain");
+            sw.WriteLine();
+            sw.Flush();
+            Console.WriteLine($"Performed Lookup on '{ID}' returning '404 Not Found'");
+        }
+    }
+
+    // Execute a SQL query and return a SqlDataReader
+    static SqlDataReader ExecuteQuery(string query)
+    {
+        SqlConnection connection = new SqlConnection(connectionString);
+        SqlCommand command = new SqlCommand(query, connection);
+
+        connection.Open();
+        SqlDataReader reader = command.ExecuteReader();
+        return reader;
+    }
+
+    // Execute a non-query SQL command (insert/update/delete)
+    static void ExecuteNonQuery(string query)
+    {
+        SqlConnection connection = new SqlConnection(connectionString);
+        SqlCommand command = new SqlCommand(query, connection);
+
+        connection.Open();
+        command.ExecuteNonQuery();
+        connection.Close();
+    }
+
+    // Lookup a field for a user from the Person table
+    static string Lookup(string ID, string field)
+    {
+        string query = $"SELECT {field} FROM Person WHERE UserID = @UserID";
+        using (var reader = ExecuteQuery(query))
+        {
+            if (reader.HasRows)
+            {
+                reader.Read();
+                return reader[field].ToString();
+            }
+        }
+        return null; // Return null if no rows found
+    }
+
+    // Update a field in the Person table for a given UserID
+    static void Update(string ID, string field, string update)
+    {
+        string query = $"UPDATE Person SET {field} = @Value WHERE UserID = @UserID";
+        SqlCommand command = new SqlCommand(query, new SqlConnection(connectionString));
+
+        command.Parameters.AddWithValue("@UserID", ID);
+        command.Parameters.AddWithValue("@Value", update);
+
+        ExecuteNonQuery(command.CommandText);
+        Console.WriteLine("OK");
+    }
+
+    // Delete a user record from the Person table
+    static void Delete(string ID)
+    {
+        string query = $"DELETE FROM Person WHERE UserID = @UserID";
+        SqlCommand command = new SqlCommand(query, new SqlConnection(connectionString));
+
+        command.Parameters.AddWithValue("@UserID", ID);
+
+        ExecuteNonQuery(command.CommandText);
+        Console.WriteLine($"User '{ID}' deleted.");
+    }
+
+    // Process external commands (e.g., delete, update) passed via arguments
+    static void ProcessCommand(string command)
+    {
+        if (debug) Console.WriteLine($"\nCommand: {command}");
+        try
+        {
+            string[] slice = command.Split('?', 2);
+            string ID = slice[0];
+            string? operation = null;
+            string? field = null;
+            string? update = null;
+
+            if (slice.Length == 2)
+            {
+                operation = slice[1];
+                if (operation == "") // This is a record delete command, i.e. "userId?"
+                {
+                    Delete(ID);
+                    return;
+                }
+
+                string[] pieces = operation.Split('=', 2);
+                field = pieces[0];
+                if (pieces.Length == 2)
+                {
+                    update = pieces[1];
+                }
+            }
+
+            Console.Write($"Operation on ID '{ID}'\n");
+
+            if (operation == null || update == null && (!Lookup(ID, "UserID")))
+            {
+                Console.WriteLine($"User '{ID}' not known");
+                return;
+            }
+
+            if (operation == null) // Perform a lookup
+                Console.WriteLine(Lookup(ID, "Location"));
+            else if (update == null) // Field lookup
+                Console.WriteLine(Lookup(ID, field));
+            else // Update operation
+                Update(ID, field, update);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"Fault in Command Processing: {e.ToString()}");
+        }
+    }
+}
