@@ -1,0 +1,16 @@
+namespace whois
+
+
+{
+    public class User
+    {
+        public string UserID { get; set; } = "";
+        public string Surname { get; set; } = "";
+        public string Forenames { get; set; } = "";
+        public string Title { get; set; } = "";
+        public string Position { get; set; } = ""; // simplified: first position
+        public string Phone { get; set; } = "";    // simplified: first phone
+        public string Email { get; set; } = "";    // simplified: first email
+        public string Location { get; set; } = "";
+    }
+};
