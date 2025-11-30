@@ -1,23 +1,17 @@
 using System;
-using System.Collections.Generic;
-using System.Data;
-using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using Microsoft.Data.SqlClient;
-using whois; // your User class namespace (you said you moved it)
+using whois;
 
 namespace SqlBackedServer
 {
     public class Program
     {
-        // === Configuration ===
-        // Change this to your DB (example shown)
         private static readonly string connectionString = @"Server=localhost;Database=UsersDB;Trusted_Connection=True;TrustServerCertificate=True;";
         private static readonly bool debug = true;
         private static readonly int serverPort = 5000;
 
-        // Allowed single-valued columns in Application.Person (case-insensitive handling done separately)
         private static readonly string[] allowedPersonColumns = new string[]
         {
             "UserID",
@@ -50,9 +44,6 @@ namespace SqlBackedServer
             }
         }
 
-        // --------------------------------------------------------------------
-        // Server: simple TCP listener that understands small HTTP-like requests
-        // --------------------------------------------------------------------
         private static void RunServer()
         {
             TcpListener listener;
@@ -89,7 +80,6 @@ namespace SqlBackedServer
             if (debug) Console.WriteLine("Server terminating.");
         }
 
-        // Very small HTTP-like handler for network clients
         private static void doRequest(NetworkStream socketStream)
         {
             StreamWriter sw = new StreamWriter(socketStream);
@@ -107,7 +97,6 @@ namespace SqlBackedServer
 
                 if (debug) Console.WriteLine("Received Network Command: " + line);
 
-                // POST / HTTP/1.1  <- used by previous program as update of Location
                 if (line == "POST / HTTP/1.1")
                 {
                     if (debug) Console.WriteLine("Network: received POST update request");
@@ -137,7 +126,6 @@ namespace SqlBackedServer
 
                     if (body.Length > 0)
                     {
-                        // expected body: id=cssbct&location=Some%20Place (no URL-decode here for simplicity)
                         string[] parts = body.Split(new char[] { '&' }, 2);
                         if (parts.Length == 2)
                         {
@@ -194,7 +182,6 @@ namespace SqlBackedServer
                     return;
                 }
 
-                // Unknown network command
                 sw.WriteLine("HTTP/1.1 400 Bad Request");
                 sw.WriteLine("Content-Type: text/plain");
                 sw.WriteLine();
@@ -212,9 +199,6 @@ namespace SqlBackedServer
             }
         }
 
-        // --------------------------------------------------------------------
-        // Command-line processing (same syntax as before: id, id?field, id?field=value, id?)
-        // --------------------------------------------------------------------
         private static void ProcessCommand(string command)
         {
             if (debug) Console.WriteLine("\nCommand: " + command);
@@ -275,9 +259,6 @@ namespace SqlBackedServer
             }
         }
 
-        // --------------------------------------------------------------------
-        // High-level operations
-        // --------------------------------------------------------------------
         private static void Dump(string userId)
         {
             if (debug) Console.WriteLine("Dump: output all fields for " + userId);
@@ -335,7 +316,7 @@ namespace SqlBackedServer
             Console.WriteLine(output);
         }
 
-        // Returns canonical field name (Title case) if allowed; otherwise returns empty string
+        // Returns field name (Title case) if can if not returns nothing
         private static string NormalizeFieldName(string field)
         {
             string trimmed = field.Trim();
@@ -352,11 +333,11 @@ namespace SqlBackedServer
             if (lower == "email") return "Email";
             if (lower == "position") return "Position";
 
-            // unknown field -> return empty to cause empty output
+            
             return "";
         }
 
-        // Returns the string value for a given canonical field name
+        // Returns the string value for a given field name
         private static string LookupFieldValue(string userId, string canonicalField)
         {
             if (canonicalField.Length == 0) return "";
@@ -374,11 +355,11 @@ namespace SqlBackedServer
                 return GetAllPositions(userId);
             }
 
-            // remaining fields are in Application.Person
+            
             return GetPersonField(userId, canonicalField);
         }
 
-        // Update handler: single-valued columns are updated; multi-valued columns add new entries
+        // Update handler, single-valued columns are updated
         private static void Update(string userId, string? field, string? value)
         {
             if (field == null || field.Length == 0 || value == null)
@@ -421,7 +402,7 @@ namespace SqlBackedServer
                 return;
             }
 
-            // Single-valued column update - ensure column is allowed (safety)
+            // Single-valued column update
             bool allowed = false;
             for (int i = 0; i < allowedPersonColumns.Length; i++)
             {
@@ -438,7 +419,6 @@ namespace SqlBackedServer
                 return;
             }
 
-            // Safe update: column name is validated above; value is parameterised
             using (SqlConnection conn = new SqlConnection(connectionString))
             {
                 conn.Open();
@@ -489,9 +469,6 @@ namespace SqlBackedServer
             }
         }
 
-        // --------------------------------------------------------------------
-        // Database helpers
-        // --------------------------------------------------------------------
         private static bool ExistsPerson(string userId)
         {
             using (SqlConnection conn = new SqlConnection(connectionString))
@@ -564,7 +541,6 @@ namespace SqlBackedServer
                     }
                 }
 
-                // multi-valued fields: return comma-separated lists
                 u.Email = GetAllEmails(userId);
                 u.Phone = GetAllPhones(userId);
                 u.Position = GetAllPositions(userId);
