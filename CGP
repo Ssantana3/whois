@@ -8,9 +8,9 @@ namespace SqlBackedServer
 {
     public class Program
     {
-        private static readonly string connectionString = @"Server=localhost;Database=UsersDB;Trusted_Connection=True;TrustServerCertificate=True;";
+        private static readonly string connectionString = @"Server=localhost;Database=UserDb3;Trusted_Connection=True;TrustServerCertificate=True;";
         private static readonly bool debug = true;
-        private static readonly int serverPort = 5000;
+        private static readonly int serverPort = 443;
 
         private static readonly string[] allowedPersonColumns = new string[]
         {
